@@ -2,6 +2,7 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PTE Practice</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230e6b62'/%3E%3Ctext x='16' y='21' font-size='12' font-family='Arial' font-weight='700' fill='white' text-anchor='middle'%3EPTE%3C/text%3E%3C/svg%3E">
+<script>window.onerror=function(m){var e=document.getElementById('fbmsg');if(e)e.innerHTML='The app could not start in this browser ('+String(m).replace(/</g,'&lt;')+'). Please use an up-to-date Chrome or Edge, or the online version below.'};</script>
 <script>window.BAKED=/*BAKED*/null/*END*/;try{var s=JSON.parse(localStorage.getItem('pte_practice_v1')||'null')||window.BAKED;document.documentElement.dataset.theme=(s&&s.theme)||'light'}catch(e){}</script>
 <style>
 :root{
@@ -136,7 +137,12 @@ label.sw{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14.5px
 }
 
 </style></head>
-<body><main id="app"></main>
+<body><main id="app"><div id="fallback" style="max-width:560px;margin:40px auto;padding:22px;font:16px/1.6 system-ui,sans-serif;color:#2a2520;background:#fffdf8;border:1px solid #e3dacb;border-radius:12px">
+<h2 style="margin-top:0">PTE Practice</h2>
+<p id="fbmsg">This app needs a full web browser to run. It looks like this file was opened in a <b>preview</b> (for example inside Gmail, WhatsApp or a Files app), which can't run apps.</p>
+<p><b>On a phone:</b> use the online version: <a href="https://jvdsnz.github.io/pte-practice/">jvdsnz.github.io/pte-practice</a> (open it in Chrome).</p>
+<p><b>On a computer:</b> download the file, then right-click it → <i>Open with</i> → <b>Google Chrome</b> or <b>Microsoft Edge</b>.</p>
+</div></main>
 <script>
 // Content set 1: Read Aloud, sentences (Repeat Sentence + Write from Dictation), Answer Short Question,
 // Respond to a Situation, Summarize Group Discussion. All original text written for this app.
@@ -903,7 +909,7 @@ function load() {
   try { ls = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); } catch (e) {}
   try { bk = window.BAKED || null; } catch (e) {}
   const pick = (!ls || (bk && (bk.savedAt || 0) > (ls.savedAt || 0))) ? bk : ls;
-  return Object.assign(structuredClone(DEFAULT_STATE), pick || {});
+  return Object.assign(JSON.parse(JSON.stringify(DEFAULT_STATE)), pick || {});
 }
 let saveTimer = null;
 function save(now) {
@@ -1619,8 +1625,8 @@ const ORDER = ['PI', 'RA', 'RS', 'DI', 'RL', 'ASQ', 'SGD', 'RTS', 'SWT', 'WE', '
 
 /* ===== UI: pages, practice player, mock exams, progress, typing test, guide, settings ===== */
 const SRC = '<!DOCTYPE html>\n' + document.documentElement.outerHTML; // pristine copy, used for "download with my progress"
-const APP_VERSION = 'V1.1';
-const root = $('#app');
+const APP_VERSION = 'V1.2';
+const root = $('#app'); root.innerHTML = '';
 let CUR = null; // active item context
 function kill() { if (CUR) { CUR.kill(); CUR = null; } TTS.stop(); }
 function makeCtx({ mock, timed, done }) {
@@ -1875,8 +1881,8 @@ function settings() {
   $('#mr', m).onchange = e => { S.micRule = e.target.checked; save(); };
   $('#bake', m).onclick = () => { save(true); const data = JSON.stringify(S).replace(/</g, '\\u003c'); const mk = '/*BA' + 'KED*/'; const html = SRC.replace(new RegExp('\\/\\*BA' + 'KED\\*\\/[\\s\\S]*?\\/\\*END\\*\\/'), () => mk + data + '/*END*/'); download('PTE_Practice_' + APP_VERSION + '_with_progress.html', html, 'text/html'); };
   $('#exp', m).onclick = () => download('pte_progress_' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify(S), 'application/json');
-  $('#imp', m).onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const d = JSON.parse(await f.text()); if (!d.attempts) throw 0; S = Object.assign(structuredClone(DEFAULT_STATE), d); save(true); applyTheme(); alert('Progress restored.'); close(); go('home'); } catch (x) { alert('That file is not a valid backup.'); } };
-  $('#rst', m).onclick = () => { if (confirm('Delete ALL progress, attempts and mock results? This cannot be undone.')) { const th = S.theme; S = structuredClone(DEFAULT_STATE); S.theme = th; save(true); close(); go('home'); } };
+  $('#imp', m).onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const d = JSON.parse(await f.text()); if (!d.attempts) throw 0; S = Object.assign(JSON.parse(JSON.stringify(DEFAULT_STATE)), d); save(true); applyTheme(); alert('Progress restored.'); close(); go('home'); } catch (x) { alert('That file is not a valid backup.'); } };
+  $('#rst', m).onclick = () => { if (confirm('Delete ALL progress, attempts and mock results? This cannot be undone.')) { const th = S.theme; S = JSON.parse(JSON.stringify(DEFAULT_STATE)); S.theme = th; save(true); close(); go('home'); } };
 }
 function download(name, text, type) { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); }
 
