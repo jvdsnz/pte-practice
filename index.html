@@ -135,6 +135,7 @@ label.sw{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14.5px
   .wrap{padding:0 12px}.card{padding:14px}
   h1{font-size:22px}
 }
+.filebar{background:var(--warn-soft);border-bottom:1px solid var(--warn);padding:8px 0}.filebar .row{gap:10px;flex-wrap:wrap}
 
 </style></head>
 <body><main id="app"><div id="fallback" style="max-width:560px;margin:40px auto;padding:22px;font:16px/1.6 system-ui,sans-serif;color:#2a2520;background:#fffdf8;border:1px solid #e3dacb;border-radius:12px">
@@ -1021,45 +1022,83 @@ const TTS = {
   }
 };
 TTS.init();
-function beep(ms = 350, f = 880) { try { const ac = new (window.AudioContext || window.webkitAudioContext)(); const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = f; g.gain.value = .12; o.connect(g); g.connect(ac.destination); o.start(); setTimeout(() => { o.stop(); ac.close(); }, ms); } catch (e) {} return sleep(ms); }
+/* ---------- one shared AudioContext (Safari/iPhone allow only a few, and they start "suspended") ---------- */
+let AC = null;
+function audioCtx() { try { if (!AC || AC.state === 'closed') AC = new (window.AudioContext || window.webkitAudioContext)(); if (AC.state === 'suspended') AC.resume().catch(() => {}); } catch (e) { AC = null; } return AC; }
+document.addEventListener('pointerdown', () => { if (AC && AC.state === 'suspended') AC.resume().catch(() => {}); }, true);
+function beep(ms = 350, f = 880) { try { const ac = audioCtx(); const o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = f; g.gain.value = .12; o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + ms / 1000); } catch (e) {} return sleep(ms); }
 
-/* ---------- Microphone: record audio + live transcript (Chrome / Edge) ---------- */
+/* ---------- Microphone: record audio + live transcript ----------
+   Phones (Android / iPhone): the speech recogniser needs the microphone to itself. If the page also opens the
+   mic for recording, the recogniser hears nothing (no marks) and keeps re-asking. So on phones we use speech-to-text
+   only; on computers we record audio as well. The mic is opened once per visit and kept. */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const IS_PHONE = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const IS_FILE = !/^https?:$/.test(location.protocol);
+const ONLINE_URL = 'https://jvdsnz.github.io/pte-practice/';
+const SR_FATAL = { 'not-allowed': 1, 'service-not-allowed': 1, 'audio-capture': 1, 'network': 1, 'language-not-supported': 1, 'bad-grammar': 1 };
 const MIC = { stream: null,
-  async get() { if (this.stream && this.stream.active) return this.stream; this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); return this.stream; } };
+  async get() {
+    if (this.stream && this.stream.getAudioTracks().some(t => t.readyState === 'live')) return this.stream;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nomic');
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    return this.stream;
+  },
+  async state() { try { return (await navigator.permissions.query({ name: 'microphone' })).state; } catch (e) { return 'unknown'; } }
+};
+// join recogniser results; Android repeats earlier words inside later results, so drop a phrase the next one already contains
+function joinFinals(list) { const out = []; for (const t of list.map(x => x.trim()).filter(Boolean)) { const prev = out[out.length - 1]; if (prev && t.toLowerCase().startsWith(prev.toLowerCase())) out[out.length - 1] = t; else if (!(prev && t.split(' ').length >= 3 && prev.toLowerCase().endsWith(t.toLowerCase()))) out.push(t); } return out.join(' '); }
 class Recorder {
-  constructor() { this.final = ''; this.interim = ''; this.on = false; }
+  constructor() { this.done = []; this.sess = []; this.interim = ''; this.on = false; this.srErr = null; this.restarts = 0; }
   async start({ onLevel, onText, onSilence, silenceMs = 3000 } = {}) {
     this.t0 = performance.now(); this.on = true; this.lastVoice = performance.now(); this.spoke = false; this.voiced = 0;
-    try { this.stream = await MIC.get(); } catch (e) { this.err = 'mic'; this.on = false; throw e; }
-    try { this.chunks = []; this.mr = new MediaRecorder(this.stream); this.mr.ondataavailable = e => e.data.size && this.chunks.push(e.data); this.mr.start(250); } catch (e) { this.mr = null; }
-    try {
-      this.ac = new (window.AudioContext || window.webkitAudioContext)(); const src = this.ac.createMediaStreamSource(this.stream); this.an = this.ac.createAnalyser(); this.an.fftSize = 1024; src.connect(this.an);
-      const buf = new Float32Array(this.an.fftSize); let lastT = performance.now();
-      const tick = () => { if (!this.on) return; this.an.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x; const rms = Math.sqrt(s / buf.length); const now = performance.now();
-        if (rms > 0.012) { this.lastVoice = now; this.spoke = true; this.voiced += now - lastT; } lastT = now;
-        onLevel && onLevel(clamp(rms * 9, 0, 1));
-        if (onSilence && now - this.lastVoice > silenceMs) { onSilence(); return; }
-        this.raf = requestAnimationFrame(tick); };
-      tick();
-    } catch (e) {}
-    if (SR) {
-      const r = this.rec = new SR(); r.lang = S.recLang || 'en-GB'; r.continuous = true; r.interimResults = true;
-      r.onresult = e => { let it = ''; for (let i = e.resultIndex; i < e.results.length; i++) { const x = e.results[i]; if (x.isFinal) this.final += x[0].transcript + ' '; else it += x[0].transcript; } this.interim = it; this.lastVoice = performance.now(); onText && onText(this.text()); };
-      r.onerror = e => { if (e.error === 'not-allowed' || e.error === 'service-not-allowed') this.srErr = e.error; if (e.error === 'network') this.srErr = 'network'; };
-      r.onend = () => { if (this.on && !this.srErr) { try { r.start(); } catch (e) {} } else this._srDone && this._srDone(); };
-      try { r.start(); } catch (e) {}
+    this.srOnly = !!(SR && IS_PHONE); this.onText = onText; this.onLevel = onLevel;
+    if (!this.srOnly) {
+      try { this.stream = await MIC.get(); } catch (e) { this.on = false; this.err = 'mic'; throw e; }
+      try { this.chunks = []; this.mr = new MediaRecorder(this.stream); this.mr.ondataavailable = e => e.data.size && this.chunks.push(e.data); this.mr.start(250); } catch (e) { this.mr = null; }
+      try {
+        const ac = audioCtx(); this.src = ac.createMediaStreamSource(this.stream); this.an = ac.createAnalyser(); this.an.fftSize = 1024; this.src.connect(this.an);
+        const buf = new Float32Array(this.an.fftSize); let lastT = performance.now(), floor = 0.004, live = false;
+        const tick = () => { if (!this.on) return; this.an.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x; const rms = Math.sqrt(s / buf.length); const now = performance.now();
+          if (rms > 0) live = true; floor = rms < floor ? rms : floor + (rms - floor) * 0.002; // slow-rising noise floor, so quiet mics still count as speech
+          if (rms > Math.max(0.006, floor * 2.5)) { this.lastVoice = now; this.spoke = true; this.voiced += now - lastT; } lastT = now;
+          onLevel && onLevel(clamp(rms * 9, 0, 1));
+          // silence rule: only when the meter is really hearing the mic; 3 s after you stop, or 5 s if you never start
+          const quiet = now - this.lastVoice, limit = this.spoke ? silenceMs : silenceMs + 2000;
+          if (onSilence && live && ac.state === 'running' && quiet > limit) { onSilence(); return; }
+          this.raf = requestAnimationFrame(tick); };
+        tick();
+      } catch (e) {}
     }
+    if (SR) this.listen(); else if (this.srOnly) { this.on = false; throw new Error('nosr'); }
   }
-  text() { return (this.final + ' ' + this.interim).replace(/\s+/g, ' ').trim(); }
+  listen() {
+    const r = this.rec = new SR(); r.lang = S.recLang || 'en-GB'; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
+    this.sess = []; const started = performance.now();
+    r.onresult = e => { const fin = []; let it = ''; for (let i = 0; i < e.results.length; i++) { const x = e.results[i]; if (x.isFinal) fin.push(x[0].transcript); else it += x[0].transcript + ' '; }
+      this.sess = fin; this.interim = it; this.lastVoice = performance.now(); this.spoke = true; if (this.srOnly && this.onLevel) this.onLevel(.7);
+      this.onText && this.onText(this.text()); };
+    if (this.srOnly) { r.onspeechstart = r.onsoundstart = () => { this.lastVoice = performance.now(); this.onLevel && this.onLevel(.5); }; r.onspeechend = () => this.onLevel && this.onLevel(0); }
+    r.onerror = e => { if (SR_FATAL[e.error]) this.srErr = e.error; };
+    r.onend = () => {
+      this.done.push(...this.sess); this.sess = []; if (this.interim.trim()) { this.done.push(this.interim); this.interim = ''; } // keep words the recogniser had not finalised
+      if (this.srErr === 'language-not-supported' && r.lang !== 'en-US') { this.srErr = null; S.recLang = 'en-US'; }
+      if (this.on && !this.srErr && this.restarts < 40) { this.restarts++; setTimeout(() => { if (this.on) this.listen(); }, performance.now() - started < 1000 ? 400 : 60); }
+      else if (this._srDone) this._srDone();
+    };
+    try { r.start(); } catch (e) { this.srErr = this.srErr || 'start'; }
+  }
+  text() { return joinFinals([...this.done, ...this.sess, this.interim]).replace(/\s+/g, ' ').trim(); }
   async stop() {
     if (!this.on) return this.out; this.on = false; cancelAnimationFrame(this.raf);
     const secs = (performance.now() - this.t0) / 1000;
-    if (this.rec) { await new Promise(res => { this._srDone = res; try { this.rec.stop(); } catch (e) { res(); } setTimeout(res, 1600); }); }
+    if (this.rec) { await new Promise(res => { this._srDone = res; try { this.rec.stop(); } catch (e) { res(); } setTimeout(res, 2000); }); }
     let url = null;
-    if (this.mr && this.mr.state !== 'inactive') { await new Promise(res => { this.mr.onstop = res; this.mr.stop(); setTimeout(res, 800); }); url = URL.createObjectURL(new Blob(this.chunks, { type: this.mr.mimeType || 'audio/webm' })); }
-    try { this.ac && this.ac.close(); } catch (e) {}
-    this.out = { transcript: this.text(), url, secs, voicedSecs: this.voiced / 1000, srErr: this.srErr, hasSR: !!SR };
+    if (this.mr && this.mr.state !== 'inactive') { await new Promise(res => { this.mr.onstop = res; this.mr.stop(); setTimeout(res, 800); }); if (this.chunks.length) url = URL.createObjectURL(new Blob(this.chunks, { type: this.mr.mimeType || 'audio/webm' })); }
+    try { this.src && this.src.disconnect(); } catch (e) {}
+    const transcript = this.text();
+    // voiced time from the meter; on phones (no meter) use the whole recording
+    this.out = { transcript, url, secs, voicedSecs: this.srOnly ? secs : this.voiced / 1000, srErr: this.srErr, hasSR: !!SR, srOnly: this.srOnly };
     return this.out;
   }
 }
@@ -1200,7 +1239,10 @@ function speakTask(box, ctx, o) {
   const finish = (out) => {
     if (finished) return; finished = true; out = out || { transcript: '', secs: 0 };
     if (fallback) out.transcript = fallback.value;
-    const res = o.score(out); res.audioUrl = out.url; res.transcript = out.transcript; ctx.done(res, out.transcript);
+    let res = o.score(out);
+    // a technical failure (blocked or missing speech-to-text) is not the student's fault: don't record a zero
+    if (!fallback && !String(out.transcript || '').trim() && (out.srErr || out.hasSR === false)) res = { score: 0, max: 0, unmarked: true, detail: `<div class="notice"><b>Not marked:</b> the computer could not turn your speech into text, so this attempt doesn't count against you.</div>${res.detail || ''}` };
+    res.audioUrl = out.url; res.transcript = out.transcript; ctx.done(res, out.transcript);
     st.set(out.url || out.transcript ? '✔ Response recorded' : 'No response recorded'); st.secs(null); st.prog(1); st.extra(''); live.textContent = '';
   };
   const run = async () => {
@@ -1217,12 +1259,16 @@ function speakTask(box, ctx, o) {
       await recr.start({ onLevel: v => { const m = $('.meter>i', st.el); if (m) m.style.width = v * 100 + '%'; }, onText: t => { if (!ctx.mock) live.textContent = '“' + t + '”'; },
         onSilence: ctx.timed && S.micRule ? () => { stopRec('silence'); } : null });
     } catch (e) {
-      st.set('⚠️ Microphone unavailable — type what you would say instead', 'rec'); st.secs(null);
+      const why = e && e.name === 'NotAllowedError' ? 'Microphone blocked: allow it in the address bar (🔒 or 🎙 icon), then press ↻ Try again'
+        : e && (e.name === 'NotFoundError' || e.message === 'nomic') ? 'No microphone found: plug in a headset, then press ↻ Try again'
+        : e && e.name === 'NotReadableError' ? 'The microphone is being used by another app or tab: close it, then press ↻ Try again'
+        : e && e.message === 'nosr' ? 'This browser has no speech-to-text: use Chrome or Edge' : 'Microphone unavailable';
+      st.set('⚠️ ' + why + ' — or type what you would say', 'rec'); st.secs(null);
       fallback = el(`<textarea class="resp" style="min-height:110px" spellcheck="false" placeholder="Type your spoken answer here…"></textarea>`); box.append(fallback);
       const b = el(`<button class="btn pri" style="margin-top:8px">Done</button>`); b.onclick = () => finish({ transcript: fallback.value }); box.append(b); return;
     }
     const lim = ctx.timed ? o.rec : Math.max(o.rec * 2, 180); const t0 = performance.now();
-    st.set('<span class="recdot"></span>Recording', 'rec');
+    st.set('<span class="recdot"></span>Recording' + (recr.srOnly && !ctx.mock ? ' <span class="small muted">(phone: words appear as you speak)</span>' : ''), 'rec');
     const ex = st.extra(`<span class="meter"><i></i></span>`); const sb = el(`<button class="btn sm">⏹ Stop</button>`); sb.onclick = () => stopRec('button'); ex.append(sb);
     let stopped = false;
     async function stopRec(why) { if (stopped) return; stopped = true; clearInterval(iv); if (why === 'silence') live.textContent = 'Recording closed: 3 seconds of silence (real exam rule — can be switched off in Settings).'; st.set('Processing…'); const out = await recr.stop(); finish(out); }
@@ -1250,9 +1296,11 @@ function speechStats(res, out, ideal = [110, 170]) {
 }
 function transcriptBlock(out) {
   if (!out.hasSR && !out.transcript) return `<div class="notice">Your browser doesn't turn speech into text (use <b>Chrome</b> or <b>Edge</b>). Listen to your recording and compare it with the model below.</div>`;
-  if (out.srErr === 'not-allowed' || out.srErr === 'service-not-allowed') return `<div class="notice">The browser blocked speech-to-text here${location.protocol === 'file:' ? ' (this often happens when the app is opened as a file)' : ''}. Your audio was still recorded. For automatic speaking marks, use the online version: <a href="https://jvdsnz.github.io/pte-practice/" target="_blank">jvdsnz.github.io/pte-practice</a>. Your progress can move there via ⚙️ Settings → Backup file.</div>`;
-  if (out.srErr === 'network') return `<div class="notice">Speech-to-text needs an internet connection. Your audio was still recorded, so you can listen back below.</div>`;
-  return `<h3>What the computer heard</h3><div class="why">${esc(out.transcript) || '<i>(nothing — check your microphone, speak clearly and closer to the mic)</i>'}</div>`;
+  if (out.srErr === 'not-allowed' || out.srErr === 'service-not-allowed') return `<div class="notice">The browser blocked speech-to-text here${location.protocol === 'file:' ? ' (this often happens when the app is opened as a file)' : ''}. ${out.url ? 'Your audio was still recorded. ' : ''}For automatic speaking marks, use the online version: <a href="https://jvdsnz.github.io/pte-practice/" target="_blank">jvdsnz.github.io/pte-practice</a>. Your progress can move there via ⚙️ Settings → Backup file.</div>`;
+  if (out.srErr === 'network') return `<div class="notice">Speech-to-text needs an internet connection. ${out.url ? 'Your audio was still recorded, so you can listen back above.' : 'Connect to the internet and try again.'}</div>`;
+  if (out.srErr === 'audio-capture') return `<div class="notice">Speech-to-text could not reach the microphone. Close other apps or tabs that use the microphone (Zoom, Teams, WhatsApp calls), check a microphone is plugged in, then press ↻ Try again. ⚙️ Settings → <b>Test microphone</b> checks it in 5 seconds.</div>`;
+  if (out.srErr) return `<div class="notice">Speech-to-text stopped working (${esc(out.srErr)}). Reload the page and try again, or use ⚙️ Settings → <b>Test microphone</b>.</div>`;
+  return `<h3>What the computer heard</h3><div class="why">${esc(out.transcript) || '<i>(nothing — start speaking straight after the beep, close to the mic. If this keeps happening, run ⚙️ Settings → Test microphone.)</i>'}</div>`;
 }
 const SYN = { apolog: ['sorry', 'apologi'], thank: ['thank', 'grateful', 'appreciat'], explain: ['because', 'reason', 'explain', 'happen'], offer: ['offer', 'happy to', 'could', 'replace', 'pay'], suggest: ['suggest', 'maybe', 'perhaps', 'how about', 'could we', 'why don'], ask: ['could you', 'would you', 'can you', 'please', 'ask'], request: ['please', 'could you', 'would like', 'request'], greet: ['hi', 'hello', 'good morning', 'excuse me'], congratul: ['congratulat', 'well done', 'great job', 'fantastic', 'excellent'] };
 function rtsCoverage(points, transcript) {
@@ -1625,7 +1673,7 @@ const ORDER = ['PI', 'RA', 'RS', 'DI', 'RL', 'ASQ', 'SGD', 'RTS', 'SWT', 'WE', '
 
 /* ===== UI: pages, practice player, mock exams, progress, typing test, guide, settings ===== */
 const SRC = '<!DOCTYPE html>\n' + document.documentElement.outerHTML; // pristine copy, used for "download with my progress"
-const APP_VERSION = 'V1.2';
+const APP_VERSION = 'V1.3';
 const root = $('#app'); root.innerHTML = '';
 let CUR = null; // active item context
 function kill() { if (CUR) { CUR.kill(); CUR = null; } TTS.stop(); }
@@ -1646,6 +1694,41 @@ function shell() {
   $$('nav.main button').forEach(b => b.onclick = () => go(b.dataset.p));
   $('#themeBtn').onclick = () => { S.theme = S.theme === 'dark' ? 'light' : 'dark'; applyTheme(); save(); };
   $('#setBtn').onclick = settings; applyTheme();
+  if (IS_FILE) { const b = el(`<div class="filebar"><div class="wrap row"><span class="small">⚠️ You opened the downloaded <b>file</b>. Browsers ask for the microphone again on every question in a file and often block speech marking. Use the online version: it remembers the microphone and marks speaking.</span><span class="spacer"></span><button class="btn sm pri" id="goOnline">Open online version with my progress ➜</button></div></div>`);
+    $('header.top').after(b); $('#goOnline').onclick = openOnline; }
+}
+// move progress to the online version through the link itself (nothing is uploaded: the part after # never leaves the browser)
+function openOnline() {
+  save(true); const lite = JSON.parse(JSON.stringify(S)); lite.mockRun = null; for (const id in lite.attempts) lite.attempts[id].forEach(a => { delete a.d; delete a.r; }); (lite.mocks || []).forEach(m => { if (m.items) m.items = m.items.map(({ d, r, ...x }) => x); });
+  let code = ''; try { code = btoa(unescape(encodeURIComponent(JSON.stringify(lite)))); } catch (e) {}
+  window.open(ONLINE_URL + (code ? '#import=' + code : ''), '_blank');
+}
+function mergeState(inc) {
+  const byT = (a, b) => { const seen = new Set((a || []).map(x => x.t)); return [...(a || []), ...(b || []).filter(x => !seen.has(x.t))].sort((x, y) => x.t - y.t); };
+  for (const id in inc.attempts || {}) { S.attempts[id] = byT(S.attempts[id], inc.attempts[id]).slice(-8); }
+  S.mocks = byT(S.mocks, inc.mocks); S.typing = byT(S.typing, inc.typing);
+  if ((inc.savedAt || 0) > (S.savedAt || 0)) ['theme', 'voiceName', 'rate', 'randomVoice', 'recLang', 'micRule', 'timed'].forEach(k => { if (k in inc) S[k] = inc[k]; });
+  save(true);
+}
+// 5-second microphone check: shows what works and what to fix
+async function micTest(box) {
+  box.innerHTML = `<div class="status rec"><span class="lbl"><span class="recdot"></span>Say: <i>"The library opens at nine o'clock."</i></span><span class="extra row"><span class="meter"><i></i></span></span><span class="secs timer">0:05</span></div><div class="small muted" id="mtl" style="min-height:22px"></div>`;
+  const lines = []; const add = (ok, msg) => lines.push(`<li>${ok === true ? '<span class="tag-ok">✔</span>' : ok === false ? '<span class="tag-no">✘</span>' : '<span class="tag-mid">●</span>'} ${msg}</li>`);
+  const perm0 = await MIC.state(); const r = new Recorder(); let peak = 0, err = null;
+  try { await r.start({ onLevel: v => { peak = Math.max(peak, v); const m = $('.meter>i', box); if (m) m.style.width = v * 100 + '%'; }, onText: t => { const l = $('#mtl', box); if (l) l.textContent = '“' + t + '”'; } }); } catch (e) { err = e; }
+  if (!err) { const t0 = performance.now(); while (performance.now() - t0 < 5000) { const tm = $('.secs', box); if (!tm) { r.stop(); return; } tm.textContent = fmtT(5 - (performance.now() - t0) / 1000); await sleep(200); } }
+  const out = err ? null : await r.stop(); const perm = await MIC.state();
+  if (IS_FILE) add(false, 'Running from a downloaded <b>file</b>. The browser will keep asking for the microphone. <a href="#" onclick="openOnline();return false">Open the online version with your progress</a>.');
+  else add(true, 'Running online (the browser can remember your microphone choice).');
+  if (err) add(false, err.name === 'NotAllowedError' ? 'Microphone is <b>blocked</b>. Click the 🔒 or 🎙 icon in the address bar → Microphone → <b>Allow</b>, then reload.' : err.name === 'NotFoundError' ? 'No microphone found. Plug in a headset.' : err.name === 'NotReadableError' ? 'Another app or tab is using the microphone. Close it and try again.' : 'Microphone error: ' + esc(err.message || err.name));
+  else if (out.srOnly) add(true, 'Phone mode: speech-to-text listens directly (no playback of your recording on phones).');
+  else add(peak > 0.08 ? true : false, peak > 0.08 ? 'Microphone is picking up sound.' : 'The microphone heard almost nothing. Check the right microphone is selected and not muted.');
+  if (!SR) add(false, 'This browser has no speech-to-text, so speaking can\'t be marked. Use <b>Chrome</b> or <b>Edge</b>.');
+  else if (out && out.srErr) add(false, { 'not-allowed': 'Speech-to-text was blocked by the browser.', 'service-not-allowed': 'Speech-to-text is switched off in this browser.', 'network': 'Speech-to-text needs internet, and could not connect.', 'audio-capture': 'Speech-to-text could not reach the microphone (another app may be using it).' }[out.srErr] || 'Speech-to-text error: ' + esc(out.srErr));
+  else if (out) add(out.transcript ? true : false, out.transcript ? 'Speech-to-text heard: <i>“' + esc(out.transcript) + '”</i>. Speaking will be marked.' : 'Speech-to-text heard no words. Speak louder and closer, and check your internet.');
+  if (perm === 'prompt' && perm0 === 'prompt' && !IS_FILE) add(null, 'Tip: when the browser asks, choose <b>Allow on every visit</b> (not "Allow this time") so it stops asking.');
+  if (perm === 'denied') add(false, 'The browser has the microphone set to <b>Block</b> for this site. Change it to Allow in the address bar (🔒 icon).');
+  box.innerHTML = `<ul class="small" style="margin:8px 0 0 18px;padding:0">${lines.join('')}</ul>${out && out.url ? `<div class="small muted" style="margin-top:6px">Your test recording:</div><audio controls src="${out.url}" style="width:100%"></audio>` : ''}`;
 }
 let ROUTE = { p: 'home' };
 function go(p, a = {}) {
@@ -1681,7 +1764,7 @@ VIEWS.home = () => {
   <h1>PTE Academic practice</h1><p class="muted">Every question type, real exam timing, instant marking with reasons. Progress saves automatically.</p>
   <div class="row" style="margin:14px 0 6px"><button class="btn pri" onclick="go('practice')">Practise by question type</button><button class="btn" onclick="go('mock')">Take a mock test</button><button class="btn" onclick="go('typing')">Typing speed test</button>
   ${S.mockRun && S.mockRun.list ? `<button class="btn" onclick="resumeMock()">▶ Resume mock test</button>` : ''}</div>
-  <div class="${sr && tts ? 'okbox' : 'notice'}" style="margin-top:14px">${tts ? '✔ Voice playback works.' : '✘ This browser cannot play the listening audio.'} ${sr ? '✔ Speech-to-text works, so speaking answers are marked automatically (needs internet).' : '✘ No speech-to-text in this browser. Open this file in <b>Google Chrome</b> or <b>Microsoft Edge</b> to have your speaking marked.'} Use a headset with a microphone for best results.${location.protocol === 'file:' && sr ? ' If speaking answers come back unmarked when using this file, open the online version instead: <a href="https://jvdsnz.github.io/pte-practice/" target="_blank">jvdsnz.github.io/pte-practice</a>.' : ''}</div>
+  <div class="${sr && tts ? 'okbox' : 'notice'}" style="margin-top:14px">${tts ? '✔ Voice playback works.' : '✘ This browser cannot play the listening audio.'} ${sr ? '✔ Speech-to-text is available, so speaking answers are marked automatically (needs internet).' : '✘ No speech-to-text in this browser. Open this file in <b>Google Chrome</b> or <b>Microsoft Edge</b> to have your speaking marked.'} Use a headset with a microphone for best results. <button class="btn sm" id="hmt">🎙 Test microphone (5 s)</button><div id="hmtb"></div></div>
   <h2>Your estimated scores</h2>${skillTiles(est, tot ? `Based on ${tot} practised questions. Rough guide only, on the 10–90 PTE scale. Writing tasks are estimated from form and structure, so use the AI check for a truer writing score.` : 'Answer some questions to see estimates.')}
   <div class="grid g2" style="margin-top:16px">
    <div class="card"><h3 style="margin-top:0">🎯 Highest-value tasks — practise these daily</h3><p class="small muted">These count towards two skills at once, or appear many times in the test.</p>
@@ -1690,6 +1773,7 @@ VIEWS.home = () => {
     <h3>🤖 Essays & speaking: free AI marking</h3><p class="small">After any essay, summary or speaking answer, press <b>Copy for AI scoring</b> and paste it into ChatGPT or any AI. The copied text tells the AI exactly how PTE scores that task.</p></div>
   </div>
   <p class="footer">Independent practice tool. Not affiliated with or endorsed by Pearson. All questions are original. ${APP_VERSION}</p></div>`;
+  $('#hmt').onclick = () => micTest($('#hmtb'));
 };
 
 VIEWS.practice = () => {
@@ -1725,7 +1809,7 @@ function wireResult(box, id) {
 }
 function showResult(box, code, i, res) {
   const p = res.max ? pct(res.score, res.max) : null; const t = T[code];
-  box.innerHTML = `<div class="card result ${p == null ? '' : p < 50 ? 'lo' : p < 80 ? 'mid' : ''}"><div class="row"><div>${p == null ? '<div class="score">Done</div>' : `<div class="score">${res.score} / ${res.max} <span class="small muted">(${p}%)</span></div>`}</div><span class="spacer"></span>
+  box.innerHTML = `<div class="card result ${p == null ? '' : p < 50 ? 'lo' : p < 80 ? 'mid' : ''}"><div class="row"><div>${res.unmarked ? '<div class="score">Not marked</div>' : p == null ? '<div class="score">Done</div>' : `<div class="score">${res.score} / ${res.max} <span class="small muted">(${p}%)</span></div>`}</div><span class="spacer"></span>
     <button class="btn sm" onclick="go('type',{code:'${code}',i:${i}})">↻ Try again</button><button class="btn sm pri" onclick="go('type',{code:'${code}',i:${(i + 1) % t.n()}})">Next question →</button></div>
     ${res.audioUrl ? `<div style="margin-top:10px"><div class="small muted">Your recording:</div><audio controls src="${res.audioUrl}" style="width:100%"></audio></div>` : ''}${['SWT', 'WE', 'SST', 'DI', 'RL', 'SGD', 'RTS', 'RA', 'RS'].includes(code) ? '<p class="tiny muted">Speaking and writing marks here are automatic estimates. Pearson\'s marking also judges fluency, pronunciation and grammar, which the AI check covers better.</p>' : ''}
     <div style="margin-top:10px">${res.detail || ''}</div></div>`;
@@ -1804,7 +1888,7 @@ VIEWS.mockres = ({ k }) => {
    ${skillTiles(m.est, 'Estimated on the 10–90 PTE scale from your marks in this test. Speaking and writing marks are automatic estimates, so paste those answers into an AI for a closer score.')}
    <h2>Question review</h2><p class="small muted">Click a row to see your answer, the correct answer and why.</p>
    <table class="t">${m.items.map((r, j) => { const p = r.m ? pct(r.s, r.m) : null; return `<tr class="rv" data-j="${j}" style="cursor:pointer"><td>${j + 1}</td><td>${T[r.c].name}</td><td class="small muted">${esc(T[r.c].label(r.i))}</td><td>${r.skipped ? '<span class="tag-no">time up</span>' : p == null ? '—' : `<span class="tag-${p >= 80 ? 'ok' : p >= 50 ? 'mid' : 'no'}">${r.s}/${r.m}</span>`}</td></tr><tr class="rvd" id="rvd${j}" style="display:none"><td colspan="4"><div class="why">${r.d || 'No details saved.'}</div></td></tr>`; }).join('')}</table></div>`;
-  $$('.rv', root).forEach(tr => tr.onclick = () => { const d = $('#rvd' + tr.dataset.j); d.style.display = d.style.display ? '' : 'none'; wireResult(d, ''); });
+  $$('.rv', root).forEach(tr => tr.onclick = () => { const d = $('#rvd' + tr.dataset.j); d.style.display = d.style.display ? '' : 'none'; const r = m.items[+tr.dataset.j]; wireResult(d, r.c + ':' + r.i); });
 };
 
 /* ---------- progress ---------- */
@@ -1856,7 +1940,7 @@ VIEWS.guide = () => {
    <div class="card"><h3 style="margin-top:0">Re-tell Lecture (40 s)</h3><p class="small">The speaker was talking about [topic]. First, the speaker explained that [point 1]. Then, the speaker mentioned [point 2], and also [point 3]. In conclusion, the speaker emphasised that [main message].</p></div>
    <div class="card"><h3 style="margin-top:0">Essay (4 paragraphs)</h3><p class="small"><b>Intro:</b> It is often argued that [paraphrase]. This essay will argue that [position], because [reason 1] and [reason 2].<br><b>Body 1:</b> The main reason is that… For example,… As a result,…<br><b>Body 2:</b> Furthermore,… / On the other hand,… For instance,…<br><b>Conclusion:</b> In conclusion, [restate position] because [reasons summarised].</p></div>
    <div class="card"><h3 style="margin-top:0">Summarize Spoken Text (50–70 words)</h3><p class="small">The speaker discussed [topic]. According to the lecture, [point 1]. In addition, [point 2], while [point 3]. Finally, the speaker concluded that [main message].</p></div></div>
-  <h2>Set-up tips</h2><ul><li>Use <b>Google Chrome</b> or <b>Microsoft Edge</b>: both voice playback and speech-to-text work there. Speech-to-text needs internet.</li><li>When asked, allow microphone access. A headset gives much better recognition.</li><li>Change the voice, speed and accent in ⚙️ Settings. The real test uses UK, US and Australian accents, so practise with several.</li><li>Your progress saves automatically in this browser. To move it to another computer, use ⚙️ Settings → <i>Download app with my progress</i>.</li></ul></div>`;
+  <h2>Set-up tips</h2><ul><li>Use <b>Google Chrome</b> or <b>Microsoft Edge</b>: both voice playback and speech-to-text work there. Speech-to-text needs internet.</li><li>Use the <b>online version</b> (jvdsnz.github.io/pte-practice), not a downloaded file: in a file the browser asks for the microphone on every question.</li><li>When asked, choose <b>Allow on every visit</b> for the microphone. A headset gives much better recognition. ⚙️ Settings → <b>Test microphone</b> checks everything in 5 seconds.</li><li>Change the voice, speed and accent in ⚙️ Settings. The real test uses UK, US and Australian accents, so practise with several.</li><li>Your progress saves automatically in this browser. To move it to another computer, use ⚙️ Settings → <i>Download app with my progress</i>.</li></ul></div>`;
 };
 
 /* ---------- settings ---------- */
@@ -1868,6 +1952,7 @@ function settings() {
    <div class="row" style="margin-top:8px"><span class="small">Speed</span><input type="range" id="rt" min="0.7" max="1.3" step="0.05" value="${S.rate}"><b id="rtv">${S.rate}×</b><button class="btn sm" id="vt">▶ Test</button></div>
    <h3>Speaking</h3><div class="row"><span class="small">Speech-to-text accent</span><select id="rl" style="padding:5px;border-radius:8px;border:1px solid var(--line);background:var(--surface)">${['en-GB', 'en-AU', 'en-NZ', 'en-US', 'en-IN', 'en-CA'].map(l => `<option ${l === S.recLang ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
    <label class="sw" style="margin-top:8px"><input type="checkbox" id="mr" ${S.micRule ? 'checked' : ''}> Stop recording after 3 seconds of silence (real exam rule)</label>
+   <div class="row" style="margin-top:8px"><button class="btn sm" id="smt">🎙 Test microphone (5 s)</button></div><div id="smtb"></div>
    <h3>Your saved work</h3><p class="small muted">Everything saves automatically in this browser. Use these to back it up or move it to another computer.</p>
    <div class="row"><button class="btn sm pri" id="bake">⬇ Download app with my progress</button><button class="btn sm" id="exp">⬇ Backup file</button><label class="btn sm">⬆ Restore backup<input type="file" id="imp" accept=".json" hidden></label><button class="btn sm ghost" id="rst" style="color:var(--bad)">Reset all</button></div></div></div>`);
   document.body.append(m); const close = () => m.remove();
@@ -1879,6 +1964,7 @@ function settings() {
   $('#vt', m).onclick = () => { const v = (sv && vs.find(x => x.name === sv.value)) || TTS.pick(); TTS.say('The library will be closed for renovations during the summer break.', v); };
   $('#rl', m).onchange = e => { S.recLang = e.target.value; save(); };
   $('#mr', m).onchange = e => { S.micRule = e.target.checked; save(); };
+  $('#smt', m).onclick = () => micTest($('#smtb', m));
   $('#bake', m).onclick = () => { save(true); const data = JSON.stringify(S).replace(/</g, '\\u003c'); const mk = '/*BA' + 'KED*/'; const html = SRC.replace(new RegExp('\\/\\*BA' + 'KED\\*\\/[\\s\\S]*?\\/\\*END\\*\\/'), () => mk + data + '/*END*/'); download('PTE_Practice_' + APP_VERSION + '_with_progress.html', html, 'text/html'); };
   $('#exp', m).onclick = () => download('pte_progress_' + new Date().toISOString().slice(0, 10) + '.json', JSON.stringify(S), 'application/json');
   $('#imp', m).onchange = async e => { const f = e.target.files[0]; if (!f) return; try { const d = JSON.parse(await f.text()); if (!d.attempts) throw 0; S = Object.assign(JSON.parse(JSON.stringify(DEFAULT_STATE)), d); save(true); applyTheme(); alert('Progress restored.'); close(); go('home'); } catch (x) { alert('That file is not a valid backup.'); } };
@@ -1888,7 +1974,9 @@ function download(name, text, type) { const a = document.createElement('a'); a.h
 
 /* ---------- boot ---------- */
 shell();
-(function boot() { const h = location.hash.slice(1).split('/'); if (h[0] === 'type' && T[h[1]]) go('type', { code: h[1], i: h[2] != null ? +h[2] : undefined }); else if (VIEWS[h[0]] && !['mockrun', 'mockres', 'type'].includes(h[0])) go(h[0]); else go('home'); })();
+(function boot() {
+  if (location.hash.startsWith('#import=')) { try { const inc = JSON.parse(decodeURIComponent(escape(atob(location.hash.slice(8))))); if (inc && inc.attempts) { mergeState(inc); setTimeout(() => alert('Your progress has been moved here. From now on, use this online version.'), 300); } } catch (e) { setTimeout(() => alert('The progress in the link could not be read. Use ⚙️ Settings → Backup file instead.'), 300); } try { history.replaceState(null, '', location.pathname + '#home'); } catch (e) {} }
+  const h = location.hash.slice(1).split('/'); if (h[0] === 'type' && T[h[1]]) go('type', { code: h[1], i: h[2] != null ? +h[2] : undefined }); else if (VIEWS[h[0]] && !['mockrun', 'mockres', 'type'].includes(h[0])) go(h[0]); else go('home'); })();
 
 </script>
 </body></html>
